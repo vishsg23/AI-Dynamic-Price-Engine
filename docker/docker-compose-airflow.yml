@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+
+  airflow:
+
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
+
+
+    ports:
+      - "8080:8080"
+
+
+    environment:
+
+      AIRFLOW_HOME: /opt/airflow
+
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+
+      _AIRFLOW_WWW_USER_USERNAME: admin
+
+      _AIRFLOW_WWW_USER_PASSWORD: admin
+
+
+    volumes:
+
+      - ../:/opt/airflow/project
+
+      - ../airflow/dags:/opt/airflow/dags
+
+      - ../airflow/logs:/opt/airflow/logs
+
+      - ../airflow/plugins:/opt/airflow/plugins
+
+
+    command: standalone
