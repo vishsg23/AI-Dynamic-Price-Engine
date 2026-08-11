@@ -44,3 +44,4 @@ Thumbs.db
 
 # Spark checkpoints
 data/delta/checkpoints/data/external_sources/
+data/external_sources/
