@@ -2,96 +2,109 @@ import os
 import sys
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import mean_absolute_error, r2_score
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 
-# 1. Establish paths correctly
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))  # D:\pricing_engine\src\ml
-BASE_DIR = os.path.dirname(os.path.dirname(CURRENT_DIR))  # D:\pricing_engine
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(os.path.dirname(CURRENT_DIR))
 PROCESSED_DIR = os.path.join(BASE_DIR, "data", "processed")
-
-# 2. Append the ROOT project directory to sys.path so Python can find 'ml'
 sys.path.append(BASE_DIR)
 
-# 3. Import using the folder name directly
-# To this
 from src.ml.mlflow_utils import log_model_run
 
 print("==================================================")
-print("       SECTION 6: PRODUCTION MODEL TRAINING       ")
+print("   FAIR COMPARISON: RandomForest on units_sold     ")
+print("   (same target, same split as XGBoost)            ")
 print("==================================================\n")
 
-# 4. Load your master feature dataset
 master_path = os.path.join(PROCESSED_DIR, "master_features.csv")
 if not os.path.exists(master_path):
     print(f"Error: {master_path} missing! Run merge_data.py first.")
     sys.exit(1)
 
-print("Loading integrated feature matrices...")
 df = pd.read_csv(master_path)
 
-# 5. Select Features & Target
-target_col = 'elasticity' if 'elasticity' in df.columns else df.columns[-1] # Default fallback
+# ---- FIX: real, always-populated numeric target, not the broken fallback ----
+target_col = "units_sold"
+
+# ---- Same feature set XGBoost uses, so any difference in results is
+#      actually due to the algorithm, not different inputs ----
 feature_cols = [
-    'total_units_sold', 'inventory_urgency_score', 'price_to_cost_ratio', 
-    'profit_margin_pct', 'demand_volatility', 'moving_avg_7day'
+    "current_price", "cost_price", "inventory_ratio",
+    "price_to_cost_ratio", "inventory_urgency_score", "sensitivity_encoded"
 ]
+feature_cols = [c for c in feature_cols if c in df.columns]
 
-# Ensure all targeted features exist in the data layout
-feature_cols = [col for col in feature_cols if col in df.columns]
+print(f"Target: '{target_col}'")
+print(f"Features: {feature_cols}\n")
 
-if not feature_cols:
-    print("Error: No matching numerical features found to train the model!")
-    sys.exit(1)
+df = df.dropna(subset=feature_cols + [target_col])
 
-print(f"Target variable selected: '{target_col}'")
-print(f"Training features chosen: {feature_cols}")
+# ---- FIX: same date-based split as demand_model.py, not a random split.
+#      A random split would be an easier problem (no genuine "future"
+#      data held out), so it wouldn't be a fair comparison. ----
+date_col = "date" if "date" in df.columns else None
+if date_col:
+    df[date_col] = pd.to_datetime(df[date_col])
+    df = df.sort_values(date_col)
+else:
+    print("Warning: no date column found, falling back to index order.")
 
-# --- SAFETY FIX: Force all training columns to be strictly numeric ---
-X = pd.DataFrame()
-for col in feature_cols:
-    # errors='coerce' forces any non-numeric text into NaN
-    X[col] = pd.to_numeric(df[col], errors='coerce')
+split_idx = int(len(df) * (0.70 / 0.85))  # same ratio used in demand_model.py
 
-# Clean missing entries safely for the mathematical arrays
-X = X.fillna(0)
-y = pd.to_numeric(df[target_col], errors='coerce').fillna(0)
-# --------------------------------------------------------------------
+X_train = df[feature_cols].iloc[:split_idx]
+X_test = df[feature_cols].iloc[split_idx:]
+y_train = df[target_col].iloc[:split_idx]
+y_test = df[target_col].iloc[split_idx:]
 
-# 6. Train/Test Split (Fixed the argument name typo here as well)
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+print(f"Train rows: {len(X_train)} | Test rows: {len(X_test)}\n")
 
-# 7. Model Configuration & Training
-print("\n🌲 Training production RandomForest pricing brain...")
 hyperparams = {
-    "n_estimators": 100,
-    "max_depth": 6,
+    "n_estimators": 500,   # matched to XGBoost's n_estimators for a fair comparison
+    "max_depth": 6,        # matched to XGBoost's max_depth
     "random_state": 42
 }
 
-model = RandomForestRegressor(**hyperparams)
+print("Training RandomForest...")
+model = RandomForestRegressor(**hyperparams, n_jobs=-1)
 model.fit(X_train, y_train)
 
-# 8. Model Performance Metrics Evaluation
-y_pred = model.predict(X_test)
-mae = mean_absolute_error(y_test, y_pred)
-r2 = r2_score(y_test, y_pred)
+preds = model.predict(X_test)
+train_preds = model.predict(X_train)
+
+mae = mean_absolute_error(y_test, preds)
+rmse = np.sqrt(mean_squared_error(y_test, preds))
+mape = np.mean(np.abs((y_test - preds) / (y_test + 1))) * 100
+train_mape = np.mean(np.abs((y_train - train_preds) / (y_train + 1))) * 100
+
+print(f"\nRandomForest results (same target/split as XGBoost):")
+print(f"  Test MAPE:  {mape:.1f}%")
+print(f"  Train MAPE: {train_mape:.1f}%")
+print(f"  MAE: {mae:.1f} units | RMSE: {rmse:.1f}")
+
+print(f"\nFor comparison, XGBoost's validated result was: 18.6% test MAPE")
+if mape < 18.6:
+    print(f"  -> RandomForest is BETTER on this run ({mape:.1f}% < 18.6%)")
+elif mape > 18.6:
+    print(f"  -> XGBoost is BETTER on this run ({mape:.1f}% > 18.6%)")
+else:
+    print(f"  -> Essentially tied")
 
 metrics_payload = {
-    "mae": round(mae, 4),
-    "r2_score": round(r2, 4)
+    "mae": round(float(mae), 4),
+    "rmse": round(float(rmse), 4),
+    "test_mape": round(float(mape), 2),
+    "train_mape": round(float(train_mape), 2),
 }
 
-print("Model training complete. Evaluation metrics finalized.")
-
-# 9. Push Structured Flight Records to Local MLflow Server
-print("Logging model metrics, hyperparams, and artifacts to MLflow...")
 log_model_run(
     model=model,
-    model_name="pricing_random_forest",
+    model_name="pricing_random_forest_units_sold",  # new experiment name — doesn't overwrite the old broken run
     params=hyperparams,
     metrics=metrics_payload
 )
 
 print("\n==================================================")
+print("Logged to MLflow as 'pricing_random_forest_units_sold'")
+print("Compare against 'pricing_engine_demand_forecasting_xgboost' in the MLflow UI")
+print("==================================================")

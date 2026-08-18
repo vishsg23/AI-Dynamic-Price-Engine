@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import traceback
 import pandas as pd
 
@@ -19,6 +20,7 @@ DELTA_PATH = os.path.join(BASE_DIR, "data", "delta", "processed_features")
 CHECKPOINT_PATH = os.path.join(BASE_DIR, "data", "delta", "checkpoints")
 MASTER_FEATURES_PATH = os.path.join(BASE_DIR, "data", "processed", "master_features.csv")
 OPT_OUTPUT_PATH = os.path.join(BASE_DIR, "data", "outputs", "optimization_results.csv")
+STREAMING_LOG_PATH = os.path.join(BASE_DIR, "data", "processed", "streaming_features_log.csv")
 
 os.makedirs(DELTA_PATH, exist_ok=True)
 os.makedirs(CHECKPOINT_PATH, exist_ok=True)
@@ -36,31 +38,68 @@ from src.ml import prediction_service
 from src.ml.optimization import optimize_price, build_product_level_df
 
 # ----------------------------------------------------------------
-# Everything below this point runs ONCE, before the stream starts:
-# load the trained models and build a small in-memory lookup table
-# so we're not hitting disk or re-loading models for every event.
+# Model / lookup state is now reloadable, not load-once-at-startup.
+# A dict (not separate globals) so reload_if_stale() can swap the
+# whole thing atomically without partial-update bugs.
 # ----------------------------------------------------------------
-print("Loading master_features.csv...")
-master_df = pd.read_csv(MASTER_FEATURES_PATH)
+_state = {"product_lookup": None, "mtime": None, "last_checked": 0}
 
+RELOAD_CHECK_INTERVAL_SECONDS = 60  # how often to check if the file changed
+
+
+def build_lookup():
+    print("Loading master_features.csv...")
+    master_df = pd.read_csv(MASTER_FEATURES_PATH)
+
+    print("Building static per-product lookup table...")
+    lookup = build_product_level_df(master_df)
+
+    if "base_price" not in lookup.columns:
+        lookup["base_price"] = lookup["current_price"]
+    if "cost_price" not in lookup.columns:
+        lookup["cost_price"] = lookup["current_price"] * 0.7
+    if "inventory_level" not in lookup.columns:
+        lookup["inventory_level"] = 0
+
+    lookup = lookup.set_index("product_id")
+    print(f"Ready. {len(lookup)} products in lookup table.")
+    return lookup
+
+
+def reload_if_stale():
+    """
+    Checks (at most once every RELOAD_CHECK_INTERVAL_SECONDS, to avoid a
+    disk stat() on every single micro-batch) whether master_features.csv
+    has changed since it was last loaded — e.g. because Airflow's nightly
+    retrain + update_master_data task ran while this stream was already
+    running. If so, reloads both the trained models and the product
+    lookup table, so a running stream picks up new products and a freshly
+    retrained model WITHOUT needing to be manually restarted.
+    """
+    now = time.time()
+    if now - _state["last_checked"] < RELOAD_CHECK_INTERVAL_SECONDS:
+        return
+    _state["last_checked"] = now
+
+    current_mtime = os.path.getmtime(MASTER_FEATURES_PATH)
+    if _state["mtime"] is not None and current_mtime == _state["mtime"]:
+        return  # file hasn't changed since last load
+
+    print("\n" + "=" * 60)
+    print("master_features.csv changed on disk — reloading models + lookup table")
+    print("=" * 60)
+    prediction_service.load_models()  # re-reads models/xgb_model.pkl + prophet_cache.pkl
+    _state["product_lookup"] = build_lookup()
+    _state["mtime"] = current_mtime
+    print("Reload complete. Stream continues with updated models/products.\n")
+
+
+# ---- Initial load, same as before ----
 print("Loading trained models (XGBoost + Prophet)...")
 prediction_service.load_models()
-
-print("Building static per-product lookup table...")
-product_lookup = build_product_level_df(master_df)
-
-# Not every product row is guaranteed to have these columns depending
-# on how master_features.csv was built, so fall back to something
-# sane rather than crashing the whole stream over a missing column.
-if "base_price" not in product_lookup.columns:
-    product_lookup["base_price"] = product_lookup["current_price"]
-if "cost_price" not in product_lookup.columns:
-    product_lookup["cost_price"] = product_lookup["current_price"] * 0.7
-if "inventory_level" not in product_lookup.columns:
-    product_lookup["inventory_level"] = 0
-
-product_lookup = product_lookup.set_index("product_id")
-print(f"Ready. {len(product_lookup)} products in lookup table.")
+_state["product_lookup"] = build_lookup()
+_state["mtime"] = os.path.getmtime(MASTER_FEATURES_PATH)
+_state["last_checked"] = time.time()
 
 spark = (
     SparkSession.builder
@@ -80,7 +119,6 @@ spark.sparkContext.setLogLevel("WARN")
 spark.conf.set("spark.sql.shuffle.partitions", "4")
 print("Spark Session Started")
 
-# Shape of the JSON events coming off the Kafka topic.
 event_schema = StructType([
     StructField("product_id", IntegerType()),
     StructField("units_sold", IntegerType()),
@@ -101,9 +139,6 @@ kafka_stream = (
     .load()
 )
 
-# Kafka gives us raw bytes in a "value" column — unpack the JSON out of
-# it, then drop anything that's missing a product id or has a
-# timestamp we can't parse, since those rows are useless downstream.
 parsed = (
     kafka_stream
     .select(from_json(col("value").cast("string"), event_schema).alias("data"))
@@ -115,9 +150,6 @@ parsed = (
 
 print("Kafka Connected")
 
-# Roll individual order events up into 1-minute buckets per product.
-# The watermark tells Spark how long to wait for late-arriving events
-# before it considers a window "closed" and safe to emit.
 windowed = (
     parsed
     .withWatermark("event_time", "15 seconds")
@@ -131,60 +163,92 @@ windowed = (
 )
 
 
-def score_one_product(pid, agg_row, product_lookup):
+def build_fallback_product(pid, agg_row):
     """
-    Takes one row of windowed Kafka data (already averaged/summed per
-    product for this 1-minute window) and runs it through the pricing
-    model. Returns a dict ready to go into the output CSV, or None if
-    the product isn't one we have a model/lookup entry for.
+    Builds a rough product profile for a product_id that isn't in the
+    lookup table yet — i.e. a genuinely new product that hasn't gone
+    through a batch pipeline run. Uses only what the streaming event
+    itself tells us, plus conservative generic defaults everywhere else.
+
+    This is deliberately a ROUGH ESTIMATE, not a validated price — every
+    row produced this way is tagged is_new_product=True so it's never
+    confused with a normal, fully-informed recommendation downstream.
     """
-    if pid not in product_lookup.index:
-        return None
-
-    # Start from the product's static profile (department, cost,
-    # base price, etc.) and overlay it with what's actually happening
-    # right now in the stream.
-    live_product = product_lookup.loc[pid].to_dict()
-    live_product["product_id"] = pid
-    live_product["current_price"] = agg_row["avg_price"]
-    live_product["units_sold"] = agg_row["hourly_demand"]
-    live_product["inventory_ratio"] = agg_row["avg_inventory"]
-
-    optimal_price, method = optimize_price(live_product)
-    pred_demand = prediction_service.predict_demand(optimal_price, live_product)
-    pred_profit = round((optimal_price - live_product["cost_price"]) * pred_demand, 2)
-
-    # For "current profit," ask the model what it thinks demand would be
-    # at today's price — same model, same basis optimize_price already
-    # used — rather than trusting the raw streaming count. Comparing
-    # profit at two different measurement bases would make the uplift
-    # number meaningless.
-    pred_demand_at_current = prediction_service.predict_demand(
-        live_product["current_price"], live_product
-    )
-    curr_profit = round(
-        (live_product["current_price"] - live_product["cost_price"]) * pred_demand_at_current, 2
-    )
-
-    # An expiry-driven discount isn't trying to beat normal sales — it's
-    # trying to avoid a total write-off on stock that's about to go bad.
-    # So "profit uplift" doesn't mean anything for these rows; report
-    # how much spoilage we're avoiding instead of a confusing negative number.
-    if method == "expiry_discount":
-        profit_uplift = None
-        profit_uplift_pct = None
-        spoilage_savings = round(live_product.get("inventory_level", 0) * optimal_price, 2)
-    else:
-        profit_uplift = round(pred_profit - curr_profit, 2)
-        profit_uplift_pct = round((profit_uplift / curr_profit) * 100, 1) if curr_profit != 0 else 0.0
-        spoilage_savings = None
-
-    price_change_pct = (
-        round(((optimal_price / live_product["current_price"]) - 1) * 100, 1)
-        if live_product["current_price"] else 0.0
-    )
+    current_price = float(agg_row["avg_price"]) if agg_row["avg_price"] else 0.0
+    cost_price = round(current_price * 0.7, 2) if current_price else 0.0
 
     return {
+        "product_id": pid,
+        "product_name": f"Unknown_Product_{pid}",
+        "department": "Unclassified",
+        "current_price": current_price,
+        "base_price": current_price,
+        "cost_price": cost_price,
+        "price_to_cost_ratio": round(current_price / cost_price, 2) if cost_price else 1.0,
+        "inventory_ratio": float(agg_row["avg_inventory"]) if agg_row["avg_inventory"] is not None else 0.5,
+        "inventory_urgency_score": 0.5,     # neutral — we genuinely don't know
+        "sensitivity_encoded": 1,           # neutral/"Medium" — no elasticity data yet
+        "price_elasticity": -1.0,           # prediction_service's own default
+        "units_sold": int(agg_row["hourly_demand"]) if agg_row["hourly_demand"] else 0,
+        "inventory_level": 0,
+        "stock_urgency_category": "Unknown",
+    }
+
+
+def score_one_product(pid, agg_row, product_lookup):
+    """
+    Returns (scored_dict, training_row_dict). If the product is known,
+    prices it normally. If it's NOT in the lookup table (a genuinely new
+    product), builds a rough fallback profile instead of silently
+    dropping the event — flagged clearly as is_new_product so it's never
+    mistaken for a fully-informed recommendation.
+    """
+    is_new_product = pid not in product_lookup.index
+
+    if is_new_product:
+        print(f"  [new product] product_id {pid} not in lookup table — pricing with fallback defaults")
+        live_product = build_fallback_product(pid, agg_row)
+    else:
+        live_product = product_lookup.loc[pid].to_dict()
+        live_product["product_id"] = pid
+        live_product["current_price"] = agg_row["avg_price"]
+        live_product["units_sold"] = agg_row["hourly_demand"]
+        live_product["inventory_ratio"] = agg_row["avg_inventory"]
+
+    try:
+        optimal_price, method = optimize_price(live_product)
+        pred_demand = prediction_service.predict_demand(optimal_price, live_product)
+        pred_profit = round((optimal_price - live_product["cost_price"]) * pred_demand, 2)
+
+        pred_demand_at_current = prediction_service.predict_demand(
+            live_product["current_price"], live_product
+        )
+        curr_profit = round(
+            (live_product["current_price"] - live_product["cost_price"]) * pred_demand_at_current, 2
+        )
+
+        if method == "expiry_discount":
+            profit_uplift = None
+            profit_uplift_pct = None
+            spoilage_savings = round(live_product.get("inventory_level", 0) * optimal_price, 2)
+        else:
+            profit_uplift = round(pred_profit - curr_profit, 2)
+            profit_uplift_pct = round((profit_uplift / curr_profit) * 100, 1) if curr_profit != 0 else 0.0
+            spoilage_savings = None
+
+        price_change_pct = (
+            round(((optimal_price / live_product["current_price"]) - 1) * 100, 1)
+            if live_product["current_price"] else 0.0
+        )
+    except Exception:
+        # Fallback profiles are rougher and more likely to hit an edge case
+        # (e.g. cost_price of 0) — don't let one bad new-product event kill
+        # the whole micro-batch.
+        print(f"  [new product] pricing failed for product_id {pid}, skipping this event:")
+        traceback.print_exc()
+        return None, None
+
+    scored = {
         "product_id": pid,
         "product_name": live_product.get("product_name", f"Product_{pid}"),
         "department": live_product.get("department", "General"),
@@ -201,45 +265,73 @@ def score_one_product(pid, agg_row, product_lookup):
         "optimization_method": method,
         "inventory_ratio": live_product["inventory_ratio"],
         "stock_urgency_category": live_product.get("stock_urgency_category", "Normal"),
+        "is_new_product": is_new_product,
     }
+
+    # New products still get logged for training feedback — this is how
+    # they eventually stop being "new": once merge_data.py / the next
+    # batch run picks them up properly, they'll have real cost/elasticity
+    # data instead of these fallback defaults.
+    training_row = {
+        "product_id": pid,
+        "date": pd.Timestamp.now().normalize(),
+        "units_sold": live_product["units_sold"],
+        "current_price": live_product["current_price"],
+        "cost_price": live_product["cost_price"],
+        "inventory_ratio": live_product["inventory_ratio"],
+        "price_to_cost_ratio": live_product.get(
+            "price_to_cost_ratio",
+            live_product["current_price"] / live_product["cost_price"] if live_product["cost_price"] else 0
+        ),
+        "inventory_urgency_score": live_product.get("inventory_urgency_score", 0),
+        "sensitivity_encoded": live_product.get("sensitivity_encoded", 0),
+    }
+
+    return scored, training_row
 
 
 def process_batch(batch_df, batch_id):
-    """
-    Runs once per micro-batch (every 10 seconds, per the trigger below).
-    Archives the raw windowed aggregates to Delta for audit/history,
-    then scores whatever products showed up and appends the results
-    to the output CSV.
-    """
+    reload_if_stale()  # cheap check, most calls return immediately
+
     if batch_df.isEmpty():
         print(f"[batch {batch_id}] no data this trigger")
         return
 
     batch_df.write.format("delta").mode("append").save(DELTA_PATH)
 
-    # This batch is one row per product per 1-minute window — small
-    # enough that pulling it into pandas is cheap, and it's the only
-    # way to call the existing pandas-based model code.
     batch_as_pandas = batch_df.toPandas()
 
     results = []
+    training_rows = []
     for _, row in batch_as_pandas.iterrows():
         pid = row["product_id"]
         try:
-            scored = score_one_product(pid, row, product_lookup)
+            scored, training_row = score_one_product(pid, row, _state["product_lookup"])
             if scored is not None:
                 results.append(scored)
+                training_rows.append(training_row)
         except Exception:
             print(f"[batch {batch_id}] error on product {pid}:")
             traceback.print_exc()
 
     if not results:
-        print(f"[batch {batch_id}] no matching products in lookup")
+        print(f"[batch {batch_id}] no scoreable products this batch")
         return
 
     out_df = pd.DataFrame(results)
     out_df.to_csv(OPT_OUTPUT_PATH, mode="a", header=not os.path.exists(OPT_OUTPUT_PATH), index=False)
-    print(f"[batch {batch_id}] wrote {len(out_df)} optimized rows")
+    new_product_count = out_df["is_new_product"].sum()
+    print(f"[batch {batch_id}] wrote {len(out_df)} optimized rows"
+          + (f" ({new_product_count} were new/unrecognized products)" if new_product_count else ""))
+
+    training_df = pd.DataFrame(training_rows)
+    training_df.to_csv(
+        STREAMING_LOG_PATH,
+        mode="a",
+        header=not os.path.exists(STREAMING_LOG_PATH),
+        index=False
+    )
+    print(f"[batch {batch_id}] logged {len(training_df)} rows to streaming_features_log.csv")
 
 
 query = (
@@ -254,7 +346,7 @@ query = (
 print()
 print("=" * 60)
 print("STREAMING STARTED")
-print("Listening for Kafka events...")
+print(f"Listening for Kafka events... (auto-reload check every {RELOAD_CHECK_INTERVAL_SECONDS}s)")
 print("=" * 60)
 print()
 
